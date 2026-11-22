@@ -1,8 +1,6 @@
 # 🏠 Hierarchical Multi-Agent AI Heating Control (Home Assistant)
 
-An experimental, physics-aware **Building Management System (BMS)** built on top of Home Assistant for a **1958 hydronic radiator house**. Instead of relying on static schedules or basic thermostats, this system combines real-time **PID valve control with mechanical deadband compensation**, **empirically measured thermal lag models**, a **hierarchical multi-agent AI supervisor** running on local Apple Silicon inference, and an **offline statistical log cruncher** that continuously refines long-term room profiles.
-
----
+An experimental, physics-aware **Building Management System (BMS)** built on top of Home Assistant for a **1958 hydronic radiator house**. Instead of relying on static schedules or basic thermostats, this system combines real-time **PID valve control with mechanical deadband compensation**, **empirically measured thermal lag and radiator water-mass models**, a **hierarchical multi-agent AI supervisor** running on local Apple Silicon inference, and an **offline statistical log cruncher** that continuously refines long-term room profiles.
 
 ## 🧠 System & Compute Architecture (Block Diagram)
 
@@ -23,8 +21,8 @@ flowchart TD
 
         subgraph SUPERVISOR ["2. Orchestration Layer (AI House Supervisor)"]
             SUP["🎩 AI House Supervisor (10-min cycle)<br/>(4h Digest + Hourly Forecast + Learned Profiles)"]
-            PHYS["📐 Empirical Physics & Dead-Time Model<br/>• Steady-state lag: LR/Hall 5–10m | Bed 10–15m | Office 20–25m<br/>• Cold-start multiplier: 1.75–2.0x (cold pipe / ΔT ≥ 0.4°C)"]
-            BOOST["🔥 Emergency Cross-Zone Boost Logic<br/>(Uses central Hallway/LR only when deficit ≥ 0.55°C)"]
+            PHYS["📐 Empirical Physics & Radiator Mass Model<br/>• Steady-state lag: LR/Hall 5–10m | Bed 10–15m | Office 20–25m<br/>• Cold-start multiplier: 1.75–2.0x (cold pipe / ΔT ≥ 0.4°C)<br/>• 1958 Type 10/20/30 water-volume thermal inertia"]
+            BOOST["🔥 Emergency Cross-Zone Boost Logic<br/>(Uses central Hallway/LR only when deficit ≥ 0.60°C)"]
         end
 
         subgraph GUARDS ["3. Zone Agent Layer (Event-Driven Awakening)"]
@@ -67,18 +65,27 @@ flowchart TD
     G1 & G2 & G3 & G4 -- "Tunes Kp / Ki / Kd / I-mem,<br/>holds steady, or calibrates TRV" --> PID
     S1 & S2 -- "Real-time feedback" --> PID
     PID --> TRV
-    TRV -. "Hydronic heat transfer<br/>(with zone dead-time)" .-> S1 & S2
+    TRV -. "Hydronic heat transfer<br/>(with zone dead-time & after-heat)" .-> S1 & S2
 ```
-
----
 
 ## ⚙️ Hardware & Compute Topology
 
 * **Core Automation & Telemetry Host (`Intel Core i7-7700` / `32 GB RAM`):** Runs Home Assistant, high-frequency SQLite telemetry queries, hybrid-resolution CSV generators, real-time PID control loops, safety interlocks, and multi-agent orchestration.
 * **Local LLM Inference Node (`Apple Mac mini M1` / `16 GB Unified Memory`):** Runs **Ollama** locally on Apple Silicon, handling all real-time inference for the **AI House Supervisor** and all **four Zone Guards** over local LAN with zero cloud dependency and predictable latency.
-* **Offline Profile Refinement (`Google Gemini Free Tier`):** A lightweight Python log cruncher (`pid_log_cruncher.py`) runs 10 times per day on pre-aggregated 24-hour statistics (RMSE, temperature swing, error distribution) to update `learned_pid_profiles.json` for the Supervisor.
+* **Offline Profile Refinement (`Google Gemini Free Tier`):** A lightweight Python log cruncher (`pid_log_cruncher.py`) runs 10 times per day on pre-aggregated 24-hour statistics (RMSE, temperature swing, error distribution) and physical radiator specs to update `learned_pid_profiles.json` for the Supervisor.
 
----
+## 🔧 Physical Hydronic Hardware Inventory (1958 Panel Radiators)
+
+The building uses original-era **1958 steel panel radiators (Type 10, 20, and 30 without convector fins)**. Because radiant heat transfer and stored water volume vary dramatically across rooms, each AI agent is explicitly modeled with the physical dimensions, panel count, and estimated water mass of its radiator(s) to anticipate heat-up lag and post-closure after-heat:
+
+| Zone / Radiator | Dimensions & Type | Est. Water Volume | Thermodynamic Behavior & Control Strategy |
+| :--- | :--- | :--- | :--- |
+| **Living Room – TV** | `2200 × 600 mm` 2-panel (Type 20, behind TV stand) | ~11.5 L | Largest water mass + partially restricted airflow; acts as a smooth, high-inertia base-load carrier (`~27%` steady duty). |
+| **Living Room – Dining** | `1500 × 600 mm` 2-panel (Type 20) | ~8.5 L | Strong radiant/convective output in open living space; handles dynamic daytime and solar load shifts. |
+| **Living Room – End Wall** | `2000 × 600 mm` 1-panel (Type 10) | ~3.8 L | Wide radiant surface under large end window with low water mass; fast response and minimal after-heat. |
+| **Office (Workroom)** | `1300 × 600 mm` 3-panel (Type 30) | ~10.5 L | Highest water-to-room-volume ratio + longest pipe run (`20–25 min` lag); ~10.5 L of hot water releases strong after-heat when PC load (`130–160 W`) starts, requiring strong $K_d$ braking. |
+| **Bedroom** | `1200 × 600 mm` 2-panel (Type 20) | ~6.5 L | Radiant-dominant emitter with moderate water inertia; $K_d$ braking prevents overshoot after valve closure. |
+| **Hallway** | `600 × 600 mm` 1-panel (Type 10) | ~1.4 L | Compact, low-inertia emitter in central corridor; acts as a steady thermal buffer for adjacent zones. |
 
 ## ✨ Key Architectural Highlights
 
@@ -87,21 +94,17 @@ flowchart TD
 * **Empirical Hydronic Dead-Time & Cold-Start Model:** All agents share a measured physical model of the 1958 hydronic loop:
   * **Steady-State Lag:** Living Room & Hallway `5–10 min`, Bedroom `10–15 min`, Office `20–25 min`.
   * **Cold-Start Multiplier (`1.75–2.0×`):** Applied automatically when valve body temperatures are cold or after setpoint steps $\ge 0.4\ ^\circ\text{C}$, preventing agents from over-tuning while heat is already propagating through the pipes.
-* **1958 Valve Mechanical Deadband & On-Demand TRV Diagnostics:** Older cast-iron/steel radiator valves exhibit mechanical stem play and magnetite deposit thresholds (`5–18%` opening before flow starts). Real-time PID loops apply asymmetric deadband mapping (`0%` closed when `pid == 0`, otherwise scaled above deadband), while Zone Guards run on-demand Shelly BLU TRV diagnostics (`trv_diag_helper.py`) and can trigger `calibrate_valve` protected by a **48-hour cooldown** and **$\ge 25\%$ battery safety lock**.
+* **1958 Valve Mechanical Deadband & On-Demand TRV Diagnostics:** Older cast-iron/steel radiator valves exhibit mechanical stem play and magnetite deposit thresholds (`5–18%` opening before flow starts). Real-time PID loops apply asymmetric deadband mapping (`0%` closed when `pid == 0`, otherwise scaled above deadband), while Zone Guards run on-demand Shelly BLU TRV diagnostics (`trv_diag_helper.py`) and can trigger `calibrate_valve` protected by a **48-hour cooldown** and $\ge 25\%$ **battery safety lock**.
 * **Window- & Disturbance-Aware Control:** Contact sensors immediately close TRVs and pause AI interventions during window ventilation (`window_open=True`), while the Hallway Guard filters brief front-door cold spikes and the Office Guard compensates for workstation power load (`power_w`).
-
----
 
 ## 📈 Measured Control Performance
 
-* **Steady-State Precision ($\pm 0.1\ ^\circ\text{C}$ Target Band):** Maintains multi-sensor living zones (e.g., Dining, Sofa, End Wall, and Central Beam reference) tightly within **$\pm 0.10\ ^\circ\text{C}$** of the `20.0 °C` setpoint across overnight outdoor swings while distributing steady fractional loads across radiators (`6%`, `7%`, `27%`) without valve hunting.
+* **Steady-State Precision ($\pm 0.1\ ^\circ\text{C}$ Target Band):** Maintains multi-sensor living zones (Dining, Sofa, End Wall, and Central Beam reference) tightly within $\pm 0.10\ ^\circ\text{C}$ of the `20.0 °C` setpoint across overnight outdoor swings while distributing steady fractional loads across radiators (`6%`, `7%`, `27%`) without valve hunting.
 * **Honest `hold` Discipline:** Guards are explicitly authorized to return `hold` when thermal lag is still settling or stability is within budget, eliminating unnecessary parameter churn.
-
----
 
 ## 📜 Production System Prompts (Sanitized Examples)
 
-Below are the actual production system prompts used to enforce physical discipline, weather feedforward, and safe TRV diagnostics.
+Below are the actual production system prompts used to enforce physical discipline, radiator thermal-mass awareness, weather feedforward, and safe TRV diagnostics.
 
 ### 1. AI House Supervisor (Orchestrator Prompt)
 
@@ -115,7 +118,13 @@ Do not misinterpret slow thermal response as a controller fault before the zone'
 - Cold start (lag x 1.75–2.0): If a radiator has been closed for a long time (low valve body temp) or a large setpoint step (>= 0.4 °C) occurs, true room air lag is 1.75–2.0x longer:
   - Living room & Hallway: 10–15 min | Bedroom: 20–25 min | Office: 35–40 min
 - Rule: If the valve is open and valve body temperature (valve_temp) is already rising, wait at least one full zone lag period before making new Kp/Ki changes or requesting cross-heating boost.
-- IMPORTANT: Valve body temperature (valve_temp) reflects ONLY the radiator valve body warming up — it does NOT represent true room air temperature.
+- IMPORTANT: Valve body temperature (valve_temp) reflects ONLY the radiator body warming up — it does NOT represent true room air temperature.
+
+RADIATOR HARDWARE & THERMAL MASS (1958 Type 10/20/30 Panel Radiators, no convector fins):
+- Living Room (3 radiators): TV 2200x600mm 2-panel (~11.5L water, behind TV stand - carries base load), Dining 1500x600mm 2-panel (~8.5L), End/Paaty 2000x600mm 1-panel (~3.8L, fast response, low after-heat).
+- Hallway: 600x600mm 1-panel (~1.4L water, compact central base-load hub).
+- Bedroom: 1200x600mm 2-panel (~6.5L water, smooth radiant heat, moderate after-heat).
+- Office: 1300x600mm 3-panel (~10.5L water, highest water-to-room-volume ratio + longest pipe run -> slow heat-up, strong post-closure after-heat).
 
 YOUR THREE TASKS:
 A) Decide which individual room guards (run_guards) to wake up for deeper 26h PID & TRV analysis (leave stable rooms untouched unless weather feedforward or a valve anomaly warrants a heads-up).
@@ -128,11 +137,13 @@ RULES FOR TRIGGERING ROOM GUARDS:
 - READ GUARD REPLIES FIRST: If a guard already replied that it is holding/waiting out thermal lag and conditions have not worsened, DO NOT re-wake it yet.
 ```
 
----
-
 ### 2. Zone Guard Prompt Pattern (Example: 3-Zone Living Room & Office)
 
 ```text
+RADIATOR HARDWARE & THERMAL MASS (1958 Panel Radiators, no convector fins):
+- Living Room: TV 2200x600mm 2-panel (~11.5L water, behind TV stand -> base load), Dining 1500x600mm 2-panel (~8.5L), End 2000x600mm 1-panel (~3.8L -> fast response, minimal after-heat).
+- Office: 1300x600mm 3-panel (~10.5L water, Type 30 -> massive water volume in a compact room + longest hydronic pipe; prioritize Kd braking and early I-memory reduction against 130–160 W workstation heat load).
+
 EXECUTION ARCHITECTURE & COORDINATION WITH SUPERVISOR:
 - You run on demand when woken by the Whole House AI Supervisor. Always inspect the 26h hybrid CSV history (15-min -26h..-6h + 5-min last 6h) to verify when the previous adjustment occurred.
 - Choosing action: hold is completely valid and encouraged when stability is within budget or thermal lag is still settling.
