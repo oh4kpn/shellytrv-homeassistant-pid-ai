@@ -1,16 +1,16 @@
 # Middle-Earth Hydronic Heating AI — Multi-Agent PID & MPC Control for a 1958 House
 
-A hierarchical, physics-aware multi-agent heating control architecture running inside **Home Assistant** on a **Mac mini M1** (local **Ollama** inference) paired with **20×/day offline cloud log analysis (Gemini API)**. Designed specifically for a 1958 hydronic radiator house with high-mass cast-iron radiators, long hydraulic pipe runs, and Shelly Blu TRVs.
+A hierarchical, physics-aware multi-agent heating control architecture running inside **Home Assistant** paired with local **Ollama** inference and **offline cloud log analysis (Gemini API)**. Designed specifically for a 1958 hydronic radiator house with high-mass cast-iron radiators, long hydraulic pipe runs, a 700L buffer tank, two heat pumps (`kone_1` and `pannu_kone2`), and Shelly Blu TRVs.
 
 ---
 
 ## System Architecture (Z-Axis Hierarchy)
 
-The system separates real-time control loops, 10-minute predictive orchestration, on-demand 26-hour telemetry analysis, and asynchronous 24-hour offline learning across four distinct tiers:
+The system separates real-time control loops, 10-minute predictive orchestration, on-demand 26-hour telemetry analysis, and asynchronous offline learning across distinct tiers:
 
 ```mermaid
 graph TD
-    subgraph Cloud ["☁️ Offline Learning Tier (20×/day, every 72 min)"]
+    subgraph Cloud ["☁️ Offline Learning Tier (Gemini API)"]
         Cruncher["🧠 PID Offline Log Cruncher<br/>(pid_log_cruncher.py + Gemini API)"]
         Profiles[("learned_pid_profiles.json")]
         Cruncher -->|Writes optimal Kp/Ki/Kd & diagnostics| Profiles
@@ -18,30 +18,31 @@ graph TD
 
     subgraph Supervisor ["🧙‍♂️ Orchestration Tier (Every 10 min)"]
         Gandalf["Gandalf the Grey — Whole House Supervisor<br/>(house_ai_supervisor.yaml + 4h Digest + Weather/Solar)"]
-        Profiles -.->|Injected into 4h digest| Gandalf
-        Gate["Deterministic Jinja2 Gate<br/>(apply_pid_map, headsup_ok, fc_delta_6h)"]
-        Gandalf --> Gate
+        ResumeScript["script.gandalf_resume_after_resync<br/>(1m delayed pass after fresh Cruncher)"]
+        Profiles -.->|updated_at & profiles| Gandalf
+        Gandalf -->|Fresh Cruncher detected| ResumeScript
+        ResumeScript -.->|Re-triggers after 1m| Gandalf
     end
 
-    subgraph Dungeon ["🔥 Boiler Room Tier (Every 10 min)"]
+    subgraph Dungeon ["🔥 Boiler Room & Cellar Tier"]
         Durin["Boiler Elf Durin<br/>(boiler_elf_durin.yaml)"]
-        Durin -->|Shared AS2 supply/return & DHW status| Gandalf
+        Yennefer["Yennefer — Cellar Supervisor<br/>(cellar_yennefer.yaml)"]
+        Lindir["Lindir — VILP Elf<br/>(hp_elf_lindir.yaml)"]
+        Durin -->|AS2 supply/return & DHW status| Gandalf
+        Yennefer -->|Cellar & HP focus| Lindir
     end
 
-    subgraph Guards ["🧝 Zone Guard Tier (Selective Triggering)"]
-        WorkElf["Work Elf (tyohuone)<br/>1300×600 Type 30 (~10.5L)"]
-        BedElf["Bed Elf (makuuhuone)<br/>1200×600 Type 20 (~6.5L)"]
-        LivingElf["Living Elf (olohuone)<br/>3 Radiators (~23.8L total)"]
-        HallElf["Hall Elf (eteinen)<br/>600×600 Type 10 (~1.4L)"]
+    subgraph Guards ["🧝 Zone Guard Tier (Async Dispatch & HH:MM Replies)"]
+        WorkElf["Forge Elf (tyohuone)<br/>1300×600 Type 30 (~10.5L)"]
+        BedElf["Chamber Elf (makuuhuone)<br/>1200×600 Type 20 (~6.5L)"]
+        LivingElf["Hearth Elf (olohuone)<br/>3 Radiators (~23.8L total)"]
+        HallElf["Corridor Elf (eteinen)<br/>600×600 Type 10 (~1.4L)"]
     end
 
-    Gate -->|"APPLY_PID (Direct write, 0 LLM)"| Guards
-    Gate -->|"Heads-up (Lightweight Ollama, no 26h CSV)"| Guards
-    Gate -->|"Action (Full 26h CSV + Ollama)"| Guards
-    Gate -.->|"Hold (Zero automation wake)"| Guards
-
-    Guards -->|"tune_pid (Kp/Ki/Kd only)"| PID["Home Assistant PID Controllers"]
-    Guards -->|"adjust_imem (I-memory only)"| PID
+    Gandalf -->|"Hold / Heads-up / Action / APPLY_PID"| Guards
+    Guards -->|"HH:MM reply in *_ai_reply_to_supervisor"| Gandalf
+    Guards -->|"tune_pid (Kp/Ki/Kd)"| PID["Home Assistant PID Controllers"]
+    Guards -->|"adjust_imem (I-memory)"| PID
     PID --> TRV["Shelly Blu TRV Actuators"]
 ```
 
@@ -49,23 +50,23 @@ graph TD
 
 ## Core Architectural Features
 
-### 1. Deterministic Jinja2 Pre-Computation & Zero-Wake `Hold`
-To eliminate floating-point hallucination in local LLM prompts and avoid unnecessary M1 CPU/GPU load:
-- **Zero-Wake `Hold`:** When a zone is within deadband or warming steadily (`Hold:`), the Supervisor leaves the room's automation completely untriggered—saving ~32 seconds of polling delays per 10-minute cycle and preserving the guard's last real status message.
-- **Deterministic `APPLY_PID` Gate:** Before calling Ollama, Jinja2 compares `learned_pid_profiles.json` against active production gains (`|dKp| >= 0.20`, `|dKi| >= 0.02`, or `|dKd| >= 0.10`) and verifies a mandatory **45-minute cooldown** via `last_changed` timestamps. Matching zones receive a deterministic `APPLY_PID` directive that writes gains directly without invoking a local LLM.
-- **Deterministic Weather `Heads-up` Gate:** 6-hour outdoor temperature deltas (`fc_delta_6h`) and 1-hour solar forecasts (`solar_1h`) are evaluated in Jinja2 against tunable thresholds (`input_number.supervisor_headsup_temp_delta` = 3.0 °C, `input_number.supervisor_headsup_solar_w` = 250 W). Any false-positive `Heads-up` generated by the LLM is automatically downgraded to `Hold` before reaching the zone guard.
+### 1. Reliable Cruncher Sync & Non-Blocking 1m Resync Pass
+- **JSON `updated_at` Verification:** Gandalf reads `updated_at` directly from `sensor.pid_learned_profiles` rather than relying solely on Home Assistant's `last_updated` timestamp, avoiding false resync triggers when no new Cruncher batch has been written.
+- **Detached 1-Minute Resume Script:** When a fresh Cruncher profile is applied, Gandalf updates `house_ai_last_synced_cruncher_ts`, hands off to `script.gandalf_resume_after_resync`, and releases its `mode: single` lock cleanly before the follow-up pass runs.
 
-### 2. Two-Tier Zone Guard Execution (Lightweight vs. Full 26h CSV)
-Each zone guard supports four distinct execution paths depending on Gandalf's structured heartbeat prefix:
-1. **`Hold:` / Idle:** Bypassed completely at the Supervisor level (or acknowledged lightly in <1s without SQLite/LLM calls).
-2. **`APPLY_PID:`:** Parses `kp`, `ki`, `kd` via regex, clamps values to safe bounds, writes directly to `input_number.<room>_kp/ki/kd`, and exits without invoking Ollama[cite: 5, 7, 9, 11].
-3. **`Heads-up:`:** Skips the 26-hour SQLite CSV extraction entirely and runs a lightweight Ollama prompt restricted strictly to `hold` or `adjust_imem` (±1.5–3.0 % feedforward for approaching frost or solar gain).
-4. **`Action:`:** Extracts 26 hours of hybrid-resolution telemetry (15-min intervals for `-26h..-6h`, 5-min intervals for the last `6h`) plus optional on-demand Shelly TRV diagnostics (`--diag`) for full PID/I-memory/calibration analysis[cite: 5, 7, 9, 11].
+### 2. Async Elf Dispatch & `HH:MM`-Timestamped Feedback Loop
+- Gandalf dispatches room guards asynchronously without waiting for them to finish, keeping the supervisor cycle fast and predictable.
+- Every guard prefixes its `*_ai_reply_to_supervisor` text with `HH:MM ` (`now().strftime('%H:%M')`), ensuring consecutive runs always show a fresh timestamp even when the message text is identical, and Gandalf feeds both the reply text and `last_changed` time into the next cycle's context.
 
-### 3. Strict Segregation of `tune_pid` vs. `adjust_imem`
-To prevent local I-memory feedforward adjustments from accidentally overwriting offline-learned PID gains:
-- **`tune_pid`** writes **only** `Kp`, `Ki`, and `Kd`.
-- **`adjust_imem`** writes **only** zone `integral` (I-memory) values (including independent per-radiator I-memories for Living Room's Dining, TV Console, and End Wall zones)[cite: 7].
+### 3. Lightweight `Hold` Path & Two-Tier Guard Execution
+- **`Hold:` / Idle:** Handled lightly without running the 26-hour SQLite/CSV history script or heavy Ollama analysis, reducing compute and I/O load during steady periods.
+- **`APPLY_PID:`:** Parses `kp`, `ki`, and `kd` from Gandalf's directive, clamps to safe bounds, and updates the corresponding `input_number` entities directly.
+- **`Heads-up:`:** Runs a lightweight Ollama check without loading the 26-hour CSV history.
+- **`Action:`:** Loads 26-hour hybrid-resolution telemetry (plus optional `--diag` TRV diagnostics) for full evaluation of `hold`, `adjust_imem`, `tune_pid`, or `calibrate_valve`.
+
+### 4. Segregation of `tune_pid` vs. `adjust_imem`
+- **`tune_pid`** updates `Kp`, `Ki`, and `Kd`.
+- **`adjust_imem`** updates zone `integral` (I-memory) values—including per-zone I-memories for Living Room (`ruokatila`, `tv_taso`, `paaty`) and 0–100 % I-memory control for Hallway (`eteinen`).
 
 ---
 
@@ -73,39 +74,35 @@ To prevent local I-memory feedforward adjustments from accidentally overwriting 
 
 | Zone (Slug) | Guardian | Radiator Inventory & Water Mass | Steady-State Lag | Cold-Start Lag | Key Thermal Characteristics |
 | :--- | :--- | :--- | :---: | :---: | :--- |
-| **Living Room** (`olohuone`) | Living Elf | 3× cast-iron (~23.8 L total: TV 2200×600 T20 ~11.5 L, Dining 1500×600 T20 ~8.5 L, End 2000×600 T10 ~3.8 L)[cite: 4, 7] | 5–10 min[cite: 4, 7] | 10–15 min (or ~45 min after >45 min full closure)[cite: 4, 7] | High thermal inertia; shared `Kp/Ki/Kd` with 3 independent I-memories[cite: 7] |
-| **Workroom** (`tyohuone`) | Work Elf | 1× cast-iron 1300×600 Type 30 (~10.5 L)[cite: 4, 5] | 20–25 min[cite: 4, 5] | 35–40 min[cite: 4, 5] | Far end of hydraulic loop; SE window (116°); workstation waste heat (~130–160 W)[cite: 5] |
-| **Bedroom** (`makuuhuone`) | Bed Elf | 1× cast-iron 1200×600 Type 20 (~6.5 L)[cite: 4, 11] | 10–15 min[cite: 4, 11] | 20–25 min[cite: 4, 11] | Sleeping target 18.0 °C; overnight occupancy load (~120–160 W); night quiet 20:00–09:00[cite: 4, 11] |
-| **Hallway** (`eteinen`) | Hall Elf | 1× buffer radiator 600×600 Type 10 (~1.4 L)[cite: 4, 9] | 5–10 min[cite: 4, 9] | 10–15 min[cite: 4, 9] | Central heat distribution corridor; filters brief front-door drafts[cite: 4, 9] |
-| **Boiler Room** (`as2`) | Boiler Elf Durin | Central main loop (`AS2 meno/paluu`) & DHW tank (`LKV varaaja`)[cite: 10] | — | — | Only place with supply/return pipe sensors; rooms only measure TRV valve body temps[cite: 4, 10] |
+| **Living Room** (`olohuone`) | Hearth Elf | 3× cast-iron (~23.8 L total: TV 2200×600 T20 ~11.5 L, Dining 1500×600 T20 ~8.5 L, End 2000×600 T10 ~3.8 L) | 5–10 min | 10–15 min | Shared `Kp/Ki/Kd` with 3 independent I-memories; solar & TV-stand heat |
+| **Workroom** (`tyohuone`) | Forge Elf | 1× cast-iron 1300×600 Type 30 (~10.5 L) | 20–25 min | 35–40 min | Far end of hydraulic loop; SE window (116°); workstation load; nightly zero-flow calibration |
+| **Bedroom** (`makuuhuone`) | Chamber Elf | 1× cast-iron 1200×600 Type 20 (~6.5 L) | 10–15 min | 20–25 min | Sleeping zone target; door/window contact guard; smooth quiet adjustments |
+| **Hallway** (`eteinen`) | Corridor Elf | 1× buffer radiator 600×600 Type 10 (~1.4 L) | 5–10 min | 10–15 min | Central corridor; primary control via `imem` (0–100 %) against drafts & swings |
+| **Boiler & Cellar** (`as2` / cellar) | Durin, Yennefer & Lindir | 700L buffer tank, Ouman 3-way mix, AS1/AS2 loops, chimney sensor, `kone_1` & `pannu_kone2` | — | — | Central pipe & heat-pump telemetry (`kaasu_in` = hot gas, `kaasu_out` = cold gas) |
 
 ---
 
 ## Repository Structure
 
 ```text
-├── packages/
-│   ├── house_ai_supervisor.yaml        # Gandalf supervisor, deterministic gates, master targets[cite: 4]
-│   ├── workroom_ai_guard_ollama.yaml   # Work Elf (single zone + workstation power)[cite: 5]
-│   ├── bedroom_ai_guard.yaml           # Bed Elf (single zone + window/occupancy)[cite: 11]
-│   ├── livingroom_ai_guard.yaml        # Living Elf (3 radiators, shared PID, 3 I-memories)[cite: 7]
-│   ├── hallway_ai_guard.yaml           # Hall Elf (central corridor + front-door filter)[cite: 9]
-│   ├── boiler_elf_durin.yaml           # Main hydronic loop & DHW sensor aggregator[cite: 10]
-│   └── pid_log_cruncher.yaml           # 20×/day Gemini offline log analysis scheduler[cite: 6]
-└── scripts/
-    ├── house_4h_digest.py              # Compiles 4h zone stats, valve anomalies & learned profiles
-    ├── pid_log_cruncher.py             # Offline Gemini API telemetry analyzer
-    ├── workroom_ai_data.py             # 26h hybrid CSV builder + TRV diagnostics
-    ├── bedroom_ai_data.py              # 26h hybrid CSV builder + TRV diagnostics
-    ├── livingroom_ai_data.py           # 26h 3-zone hybrid CSV builder + TRV diagnostics
-    └── hallway_ai_data.py              # 26h hybrid CSV builder + TRV diagnostics
+packages/keskimaa/
+├── house_ai_supervisor.yaml        # Gandalf supervisor, Cruncher sync & 1m resume script
+├── workroom_ai_guard_ollama.yaml   # Forge Elf (workroom guard + HH:MM replies)
+├── workroom_zero_flow_calib.yaml   # Nightly zero-flow valve calibration script & schedule
+├── bedroom_ai_guard.yaml           # Chamber Elf (bedroom guard + HH:MM replies)
+├── livingroom_ai_guard.yaml        # Hearth Elf (3-zone living room guard + HH:MM replies)
+├── hallway_ai_guard.yaml           # Corridor Elf (hallway guard + HH:MM replies)
+├── boiler_elf_durin.yaml           # Boiler Elf Durin (AS2 supply/return & DHW status)
+├── cellar_yennefer.yaml            # Yennefer (cellar supervisor + 4h digest + cruncher trigger)
+├── hp_elf_lindir.yaml              # Lindir (heat pump delta-T & gas state monitor)
+└── pid_log_cruncher.yaml           # Gemini offline log cruncher scheduler & sensors
 ```
 
 ---
 
 ## Safety & Guardrail Mechanisms
 
-- **Dry-Run / Production Toggle per Agent:** Every agent (`house_ai_supervisor_active`, `workroom_ai_guard_production`, `bedroom_ai_guard_production`, `livingroom_ai_guard_production`, `hallway_ai_guard_production`) can be toggled independently between `DRY-RUN` (logs proposed changes) and `PROD` (writes live setpoints/gains)[cite: 4, 5, 7, 9, 11].
-- **Strict Parameter Clamping:** All PID gains and I-memory updates are bounded in Jinja2 (`Kp`: 1.5–12.0, `Ki`: 0.05–1.0, `Kd`: 0.0–5.0, `I-memory`: ±4.0 % per step, 0–60 % total)[cite: 5, 7, 9, 11].
-- **Valve Body vs. Room Air Separation:** Prompts explicitly enforce reading room air temperature exclusively from wall/desk sensors (`temp` / `ruuvi` / `t_*`) while treating TRV `valve_temp` strictly as a hydraulic flow indicator[cite: 4, 5, 7, 9, 11].
-- **TRV Calibration Protection:** Automated Shelly Blu TRV calibration (`button.*_calibrate`) requires a confirmed diagnostic anomaly, battery level ≥ 25 %, and a minimum 48-hour cooldown since the last calibration[cite: 5, 7, 9, 11].
+- **Dry-Run / Production Toggles:** Supervisors and zone guards can be switched between `DRY-RUN` and `PROD` independently.
+- **Clamping & Safe Bounds:** `Kp`, `Ki`, `Kd`, and `I-memory` updates are bounded in templates and output strings are safely truncated (`[:254]`) to fit `input_text` limits.
+- **Valve Body vs. Room Air Separation:** Prompts distinguish radiator/valve body temperatures (`valve_temp`, `vt_*`) from room air sensors (`temp`, `ruuvi`, `t_*`).
+- **TRV Calibration Protection:** Automated Shelly Blu TRV calibration requires an anomaly, battery ≥ 25 %, and a 48-hour cooldown between calibrations.
